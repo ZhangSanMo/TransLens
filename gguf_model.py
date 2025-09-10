@@ -1,246 +1,191 @@
-import requests
-import jieba.posseg as pseg
-import random
+import asyncio
+import collections
+import hashlib
 import json
 import os
-import hashlib
+import random
 import time
-import aiosqlite
-import collections
-import asyncio
 from configparser import ConfigParser, NoSectionError, NoOptionError
+from contextlib import asynccontextmanager
 
-# --- FastAPI 相关导入 ---
+import aiosqlite
+import httpx
+import jieba.posseg as pseg
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
-from dotenv import load_dotenv
-import httpx
 
 # ==============================================================================
-# 0. 全局变量和应用生命周期管理
+# 0. 全局变量、自定义异常和应用生命周期
 # ==============================================================================
 DATABASE_FILE = "translens_data.db"
-# 将这些变量设为全局，在 startup 事件中初始化
 config = None
 translation_provider = None
 translation_cache = None
 
+# <<< 1. 定义一个自定义异常，用于清晰地表示客户端断开连接
+class ClientDisconnectedError(Exception):
+    """当检测到客户端断开连接时引发的异常。"""
+    pass
 
-# FastAPI 的应用生命周期事件，用于在应用启动时初始化资源
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 应用启动时执行
+    # ... (这部分与之前完全相同，无需修改) ...
     print("--- 应用启动 ---")
     global config, translation_provider, translation_cache
-
     load_dotenv()
     print("已加载 .env 文件中的环境变量。")
-
-    # 注意：命令行参数解析在 FastAPI 中通常不这么用，我们直接从配置读取
-    # 如果需要动态指定 provider, 推荐使用环境变量
-    # PROVIDER_NAME = os.getenv("TRANSLENS_PROVIDER", "local_llama")
-
     config = ConfigParser()
     config.read("config.ini", encoding="utf-8")
-
     default_provider_from_config = os.path.expandvars(
         config.get("DEFAULT", "provider", fallback="local_llama")
     )
     provider_name = os.getenv("TRANSLENS_PROVIDER", default_provider_from_config)
-
     print("-" * 50)
     print(f"准备启动服务，使用 API 提供者: '{provider_name}'")
-
     try:
         if not os.path.exists(DATABASE_FILE):
             print(f"数据库文件 '{DATABASE_FILE}' 不存在，正在创建...")
             await init_db()
         else:
             print(f"已连接到现有数据库: '{DATABASE_FILE}'")
-
         translation_provider = TranslationProvider(provider_name, config)
         translation_cache = TranslationCache()
-
     except (ValueError, NoSectionError, NoOptionError) as e:
         print(f"\n[错误] 初始化提供者失败: {e}")
-        print("请检查您的环境变量和 config.ini 文件是否正确。\n")
         exit(1)
-
     print("-" * 50)
     print("--- 服务初始化完成，准备接收请求 ---")
     yield
-    # 应用关闭时执行 (如果需要)
     print("--- 应用关闭 ---")
 
-
 app = FastAPI(lifespan=lifespan)
-
-# 配置 CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 允许所有来源，生产环境建议收紧
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
 # ==============================================================================
-# 1. 数据库管理 (异步改造)
+# 1. 数据库管理 (无需修改)
 # ==============================================================================
 async def get_db():
-    """
-    FastAPI 依赖注入：提供一个异步数据库连接。
-    """
     db = await aiosqlite.connect(DATABASE_FILE)
     try:
         yield db
     finally:
         await db.close()
 
-
 async def init_db():
-    """初始化数据库，创建表结构。"""
     async with aiosqlite.connect(DATABASE_FILE) as db:
-        # 创建翻译缓存表
         await db.execute("""
         CREATE TABLE IF NOT EXISTS translation_cache (
-            key TEXT PRIMARY KEY,
-            sentence TEXT NOT NULL,
-            target_word TEXT NOT NULL,
-            translation TEXT NOT NULL,
-            timestamp INTEGER NOT NULL
-        )
-        """)
-        # 创建词频表
+            key TEXT PRIMARY KEY, sentence TEXT NOT NULL, target_word TEXT NOT NULL,
+            translation TEXT NOT NULL, timestamp INTEGER NOT NULL
+        )""")
         await db.execute("""
         CREATE TABLE IF NOT EXISTS word_frequency (
-            word TEXT PRIMARY KEY,
-            frequency INTEGER NOT NULL DEFAULT 0
-        )
-        """)
+            word TEXT PRIMARY KEY, frequency INTEGER NOT NULL DEFAULT 0
+        )""")
         await db.commit()
         print("数据库表初始化完成。")
 
-
 # ==============================================================================
-# 2. 统一且可扩展的 API 提供者 (异步改造)
+# 2. API 提供者 (核心改造)
 # ==============================================================================
 class TranslationProvider:
+    # ... (__init__, _build_headers, _build_payload, _parse_response 方法无需修改) ...
     def __init__(self, provider_name, config: ConfigParser):
         if not config.has_section(provider_name):
-            raise ValueError(
-                f"配置错误: 在 config.ini 中未找到名为 '[{provider_name}]' 的配置节"
-            )
-        provider_config = config[provider_name]
-        default_config = config["DEFAULT"]
-
+            raise ValueError(f"配置错误: 在 config.ini 中未找到名为 '[{provider_name}]' 的配置节")
+        provider_config, default_config = config[provider_name], config["DEFAULT"]
         def get_config_value(section, key, fallback=""):
-            raw_value = section.get(key, fallback)
-            return os.path.expandvars(raw_value)
-
+            return os.path.expandvars(section.get(key, fallback))
         self.provider_name = provider_name
         self.api_url = get_config_value(provider_config, "api_url")
         self.model = get_config_value(provider_config, "model", fallback="default")
         self.api_key = get_config_value(provider_config, "api_key", fallback="")
         self.use_system_role = provider_config.getboolean("use_system_role", True)
-        self.system_prompt = get_config_value(
-            provider_config,
-            "system_prompt",
-            fallback=get_config_value(default_config, "system_prompt"),
-        )
-        self.proxy = get_config_value(
-            provider_config,
-            "proxy",
-            fallback=get_config_value(default_config, "proxy", None),
-        )
-        self.custom_headers = {}
-        for key, value in provider_config.items():
-            if key.startswith("header_"):
-                header_name = key[len("header_") :].replace("_", "-").title()
-                self.custom_headers[header_name] = os.path.expandvars(value)
-        self.rate_limit_count = provider_config.getint(
-            "rate_limit_count", fallback=default_config.getint("rate_limit_count", 0)
-        )
-        self.rate_limit_period = provider_config.getint(
-            "rate_limit_period_seconds",
-            fallback=default_config.getint("rate_limit_period_seconds", 60),
-        )
-
+        self.system_prompt = get_config_value(provider_config, "system_prompt", fallback=get_config_value(default_config, "system_prompt"))
+        self.proxy = get_config_value(provider_config, "proxy", fallback=get_config_value(default_config, "proxy", None))
+        self.custom_headers = {key[len("header_") :].replace("_", "-").title(): os.path.expandvars(value) for key, value in provider_config.items() if key.startswith("header_")}
+        self.rate_limit_count = provider_config.getint("rate_limit_count", fallback=default_config.getint("rate_limit_count", 0))
+        self.rate_limit_period = provider_config.getint("rate_limit_period_seconds", fallback=default_config.getint("rate_limit_period_seconds", 60))
         if self.rate_limit_count > 0:
             self.request_timestamps = collections.deque()
             self.rate_limit_lock = asyncio.Lock()
-            print(
-                f"[{self.provider_name}] 已启用速率限制: 每 {self.rate_limit_period} 秒最多 {self.rate_limit_count} 次请求。"
-            )
+            print(f"[{self.provider_name}] 已启用速率限制: 每 {self.rate_limit_period} 秒最多 {self.rate_limit_count} 次请求。")
         else:
             print(f"[{self.provider_name}] 未启用速率限制。")
 
-    async def _wait_for_rate_limit(self):
-        """如果达到速率限制，则异步等待。"""
-        if self.rate_limit_count <= 0:
-            return
-
-        async with self.rate_limit_lock:
-            current_time = time.time()
-            while (
-                self.request_timestamps
-                and self.request_timestamps[0] < current_time - self.rate_limit_period
-            ):
-                self.request_timestamps.popleft()
-
-            if len(self.request_timestamps) >= self.rate_limit_count:
-                wait_time = (
-                    self.request_timestamps[0] + self.rate_limit_period - current_time
-                )
-                if wait_time > 0:
-                    print(
-                        f"[{self.provider_name}] 达到速率限制，等待 {wait_time:.2f} 秒..."
-                    )
-                    await asyncio.sleep(wait_time)
-            self.request_timestamps.append(time.time())
-
     def _build_headers(self):
         headers = {"Content-Type": "application/json"}
-        if self.api_key and self.api_key != "no-key-required":
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        headers.update(self.custom_headers)
-        return headers
+        if self.api_key and self.api_key != "no-key-required": headers["Authorization"] = f"Bearer {self.api_key}"
+        headers.update(self.custom_headers); return headers
 
     def _build_payload(self, prompt):
         messages = []
         if self.use_system_role:
-            messages.append({"role": "system", "content": self.system_prompt})
-            messages.append({"role": "user", "content": prompt})
+            messages.extend([{"role": "system", "content": self.system_prompt}, {"role": "user", "content": prompt}])
         else:
-            full_prompt = f"{self.system_prompt}\n\n---\n\n{prompt}"
-            messages.append({"role": "user", "content": full_prompt})
+            messages.append({"role": "user", "content": f"{self.system_prompt}\n\n---\n\n{prompt}"})
         return {"model": self.model, "messages": messages}
-
+    
     def _parse_response(self, response_json):
         return response_json["choices"][0]["message"]["content"]
 
-    async def translate(self, sentence, target_word):
-        """执行翻译的完整流程 (异步)"""
-        await self._wait_for_rate_limit()
-        prompt = f"翻译下面句子中的「{target_word}」：{sentence}"
 
+    # <<< 2. 核心改造点：改造速率限制器，使其可中断
+    async def _wait_for_rate_limit(self, request: Request):
+        if self.rate_limit_count <= 0: return
+
+        async with self.rate_limit_lock:
+            current_time = time.time()
+            while self.request_timestamps and self.request_timestamps[0] < current_time - self.rate_limit_period:
+                self.request_timestamps.popleft()
+
+            if len(self.request_timestamps) >= self.rate_limit_count:
+                wait_time = self.request_timestamps[0] + self.rate_limit_period - current_time
+                if wait_time > 0:
+                    print(f"[{self.provider_name}] 达到速率限制，将等待 {wait_time:.2f} 秒...")
+                    
+                    # 将一次长等待分解为多次短等待，并在每次等待后检查连接状态
+                    end_time = time.time() + wait_time
+                    while time.time() < end_time:
+                        # 核心检查！
+                        if await request.is_disconnected():
+                            print(f"[{self.provider_name}] 客户端已断开连接，中断等待。")
+                            raise ClientDisconnectedError()
+                        # 等待一小段时间
+                        await asyncio.sleep(0.1)
+            
+            # 如果客户端在等待期间断开，这里的代码将不会执行
+            self.request_timestamps.append(time.time())
+
+    # <<< 3. 改造 translate 方法，接收 request 对象
+    async def translate(self, sentence: str, target_word: str, request: Request):
+        # 将 request 对象传递给速率限制器
+        await self._wait_for_rate_limit(request)
+        
+        # <<< 4. 在发起昂贵的API调用前，再做一次最终检查
+        if await request.is_disconnected():
+            print(f"[{self.provider_name}] 客户端在等待后、请求前断开连接，取消API调用。")
+            raise ClientDisconnectedError()
+
+        prompt = f"翻译下面句子中的「{target_word}」：{sentence}"
         headers = self._build_headers()
         payload = self._build_payload(prompt)
 
         try:
             async with httpx.AsyncClient(proxy=self.proxy, timeout=30.0) as client:
-                response = await client.post(
-                    self.api_url, headers=headers, json=payload
-                )
+                response = await client.post(self.api_url, headers=headers, json=payload)
                 response.raise_for_status()
-
             translated_content = self._parse_response(response.json())
             if len(translated_content) > 30:
                 raise ValueError("翻译结果过长")
             return translated_content
-
         except httpx.RequestError as e:
             print(f"[{self.provider_name}] 调用 API 失败: {e}")
             raise
@@ -248,134 +193,91 @@ class TranslationProvider:
             print(f"[{self.provider_name}] 解析响应失败: {e}")
             raise
 
-
 # ==============================================================================
-# 3. 缓存系统 (异步改造)
+# 3. 缓存系统 (无需修改)
 # ==============================================================================
 class TranslationCache:
-    """
-    翻译缓存类，所有数据库操作都改为异步。
-    """
-
+    # ... (这个类的所有方法都与之前相同，无需修改) ...
     def _generate_key(self, sentence, target_word):
-        key_string = f"{sentence}|{target_word}"
-        return hashlib.md5(key_string.encode("utf-8")).hexdigest()
-
+        return hashlib.md5(f"{sentence}|{target_word}".encode("utf-8")).hexdigest()
     async def get(self, sentence, target_word, db: aiosqlite.Connection):
         key = self._generate_key(sentence, target_word)
-        cursor = await db.execute(
-            "SELECT translation FROM translation_cache WHERE key = ?", (key,)
-        )
-        row = await cursor.fetchone()
-        await cursor.close()
-        return row[0] if row else None
-
+        async with db.execute("SELECT translation FROM translation_cache WHERE key = ?", (key,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
     async def set(self, sentence, target_word, translation, db: aiosqlite.Connection):
-        key = self._generate_key(sentence, target_word)
-        timestamp = int(time.time())
-        await db.execute(
-            "INSERT OR REPLACE INTO translation_cache (key, sentence, target_word, translation, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (key, sentence, target_word, translation, timestamp),
-        )
+        key, timestamp = self._generate_key(sentence, target_word), int(time.time())
+        await db.execute("INSERT OR REPLACE INTO translation_cache VALUES (?, ?, ?, ?, ?)", (key, sentence, target_word, translation, timestamp))
         await db.commit()
-
+    async def get_word_frequency(self, word, db: aiosqlite.Connection):
+        async with db.execute("SELECT frequency FROM word_frequency WHERE word = ?", (word,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
     async def increment_word_frequency(self, word, db: aiosqlite.Connection):
-        cursor = await db.execute(
-            "UPDATE word_frequency SET frequency = frequency + 1 WHERE word = ?",
-            (word,),
-        )
-        if cursor.rowcount == 0:
-            await db.execute(
-                "INSERT INTO word_frequency (word, frequency) VALUES (?, 1)", (word,)
-            )
+        async with db.execute("UPDATE word_frequency SET frequency = frequency + 1 WHERE word = ?", (word,)) as cursor:
+            if cursor.rowcount == 0:
+                await db.execute("INSERT INTO word_frequency (word, frequency) VALUES (?, 1)", (word,))
         await db.commit()
-        await cursor.close()
         new_freq = await self.get_word_frequency(word, db)
         print(f"词语 '{word}' 选择次数更新为: {new_freq}")
-
-    async def get_word_frequency(self, word, db: aiosqlite.Connection):
-        cursor = await db.execute(
-            "SELECT frequency FROM word_frequency WHERE word = ?", (word,)
-        )
-        row = await cursor.fetchone()
-        await cursor.close()
-        return row[0] if row else 0
-
     async def weighted_choice(self, words, db: aiosqlite.Connection):
-        if not words:
-            return None
-        if len(words) == 1:
-            return words[0]
-
-        # 并发获取所有词的频率
+        if not words: return None
+        if len(words) == 1: return words[0]
         freq_tasks = [self.get_word_frequency(word, db) for word in words]
         frequencies = await asyncio.gather(*freq_tasks)
-
         weights = [1.0 / (freq + 1) for freq in frequencies]
         return random.choices(words, weights=weights, k=1)[0]
 
 
 # ==============================================================================
-# 4. FastAPI 端点 (异步改造)
+# 4. FastAPI 端点 (核心改造)
 # ==============================================================================
 @app.post("/translate")
 async def translate_word(request: Request, db: aiosqlite.Connection = Depends(get_db)):
     try:
         data = await request.json()
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="无效的JSON")
+        context_sentence = data.get("sentence")
+        if not context_sentence:
+            raise HTTPException(status_code=400, detail="JSON中必须包含 'sentence' 字段")
 
-    if not data or "sentence" not in data:
-        raise HTTPException(
-            status_code=400, detail="请输入有效的JSON，并包含 'sentence' 字段"
-        )
+        words = pseg.lcut(context_sentence)
+        result = [word for word, flag in words if flag.startswith("n") or flag.startswith("v")]
+        if not result:
+            raise HTTPException(status_code=404, detail="句子中未找到可翻译的名词或动词")
 
-    context_sentence = data["sentence"]
-    # jieba 不是异步的，但在CPU密集型任务中这通常没问题
-    words = pseg.lcut(context_sentence)
-    result = [
-        word for word, flag in words if flag.startswith("n") or flag.startswith("v")
-    ]
-    if not result:
-        raise HTTPException(status_code=404, detail="句子中未找到可翻译的名词或动词")
+        target_word = await translation_cache.weighted_choice(result, db)
+        await translation_cache.increment_word_frequency(target_word, db)
 
-    target_word = await translation_cache.weighted_choice(result, db)
-    await translation_cache.increment_word_frequency(target_word, db)
+        cached = await translation_cache.get(context_sentence, target_word, db)
+        if cached:
+            print(f"从缓存命中: {target_word} -> {cached}")
+            return {"target_word": target_word, "translation": cached, "from_cache": True}
 
-    cached = await translation_cache.get(context_sentence, target_word, db)
-    if cached:
-        print(f"从缓存命中: {target_word} -> {cached}")
-        return {"target_word": target_word, "translation": cached, "from_cache": True}
-
-    try:
         print(f"通过 [{translation_provider.provider_name}] API 翻译: {target_word}")
+        
+        # <<< 5. 将 request 对象传递下去
         translated_content = await translation_provider.translate(
-            context_sentence, target_word
+            context_sentence, target_word, request=request
         )
-        await translation_cache.set(
-            context_sentence, target_word, translated_content, db
-        )
+        
+        await translation_cache.set(context_sentence, target_word, translated_content, db)
         print(f"翻译结果已缓存: {target_word} -> {translated_content}")
-        return {
-            "target_word": target_word,
-            "translation": translated_content,
-            "from_cache": False,
-        }
+        return {"target_word": target_word, "translation": translated_content, "from_cache": False}
+
+    # <<< 6. 捕获我们自定义的异常，并优雅地处理它
+    except ClientDisconnectedError:
+        # 这是一个正常的业务场景，不是服务器错误，所以我们不返回错误码
+        # 只是在服务器端记录一下，然后让连接正常关闭
+        print("请求处理被中断，因为客户端已断开连接。")
+        # 返回一个空响应或特定响应码也可以，但通常直接让连接关闭即可
+        return 
     except Exception as e:
-        # 客户端取消请求时，httpx会抛出异常，FastAPI会捕获并正确处理连接关闭
-        # 这里我们记录一个通用错误
-        print(f"处理翻译请求时发生错误: {e}")
+        print(f"处理翻译请求时发生未知错误: {e}")
         raise HTTPException(status_code=502, detail=f"处理翻译请求时发生错误: {str(e)}")
 
-
 # ==============================================================================
-# 5. 主程序入口 (用于 Uvicorn)
+# 5. 主程序入口 (无需修改)
 # ==============================================================================
 if __name__ == "__main__":
-    # 这个部分现在只是为了方便直接运行（虽然不推荐用于生产）
-    # 推荐的启动方式是: uvicorn gguf_model:app --reload
     import uvicorn
-
-    print("正在以开发模式启动 Uvicorn 服务器...")
-    print("推荐的生产启动方式是: uvicorn gguf_model:app --workers 4")
     uvicorn.run(app, host="127.0.0.1", port=5000)
