@@ -5,38 +5,106 @@ import json
 import os
 import hashlib
 import time
-import argparse
-import sqlite3
+import aiosqlite
 import collections
-import threading
+import asyncio
 from configparser import ConfigParser, NoSectionError, NoOptionError
-from flask import Flask, request, jsonify, g  # <-- 1. 导入 g
-from flask_cors import CORS
+
+# --- FastAPI 相关导入 ---
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+import httpx
 
 # ==============================================================================
-# 0. 数据库管理 (新)
+# 0. 全局变量和应用生命周期管理
 # ==============================================================================
 DATABASE_FILE = "translens_data.db"
+# 将这些变量设为全局，在 startup 事件中初始化
+config = None
+translation_provider = None
+translation_cache = None
 
 
-def get_db():
+# FastAPI 的应用生命周期事件，用于在应用启动时初始化资源
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 应用启动时执行
+    print("--- 应用启动 ---")
+    global config, translation_provider, translation_cache
+
+    load_dotenv()
+    print("已加载 .env 文件中的环境变量。")
+
+    # 注意：命令行参数解析在 FastAPI 中通常不这么用，我们直接从配置读取
+    # 如果需要动态指定 provider, 推荐使用环境变量
+    # PROVIDER_NAME = os.getenv("TRANSLENS_PROVIDER", "local_llama")
+
+    config = ConfigParser()
+    config.read("config.ini", encoding="utf-8")
+
+    default_provider_from_config = os.path.expandvars(
+        config.get("DEFAULT", "provider", fallback="local_llama")
+    )
+    provider_name = os.getenv("TRANSLENS_PROVIDER", default_provider_from_config)
+
+    print("-" * 50)
+    print(f"准备启动服务，使用 API 提供者: '{provider_name}'")
+
+    try:
+        if not os.path.exists(DATABASE_FILE):
+            print(f"数据库文件 '{DATABASE_FILE}' 不存在，正在创建...")
+            await init_db()
+        else:
+            print(f"已连接到现有数据库: '{DATABASE_FILE}'")
+
+        translation_provider = TranslationProvider(provider_name, config)
+        translation_cache = TranslationCache()
+
+    except (ValueError, NoSectionError, NoOptionError) as e:
+        print(f"\n[错误] 初始化提供者失败: {e}")
+        print("请检查您的环境变量和 config.ini 文件是否正确。\n")
+        exit(1)
+
+    print("-" * 50)
+    print("--- 服务初始化完成，准备接收请求 ---")
+    yield
+    # 应用关闭时执行 (如果需要)
+    print("--- 应用关闭 ---")
+
+
+app = FastAPI(lifespan=lifespan)
+
+# 配置 CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 允许所有来源，生产环境建议收紧
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ==============================================================================
+# 1. 数据库管理 (异步改造)
+# ==============================================================================
+async def get_db():
     """
-    为当前请求获取数据库连接。如果连接不存在，则创建一个新的。
+    FastAPI 依赖注入：提供一个异步数据库连接。
     """
-    db = getattr(g, "_database", None)
-    if db is None:
-        db = g._database = sqlite3.connect(DATABASE_FILE)
-    return db
+    db = await aiosqlite.connect(DATABASE_FILE)
+    try:
+        yield db
+    finally:
+        await db.close()
 
 
-def init_db():
+async def init_db():
     """初始化数据库，创建表结构。"""
-    with app.app_context():
-        db = get_db()
-        cursor = db.cursor()
+    async with aiosqlite.connect(DATABASE_FILE) as db:
         # 创建翻译缓存表
-        cursor.execute("""
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS translation_cache (
             key TEXT PRIMARY KEY,
             sentence TEXT NOT NULL,
@@ -46,18 +114,18 @@ def init_db():
         )
         """)
         # 创建词频表
-        cursor.execute("""
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS word_frequency (
             word TEXT PRIMARY KEY,
             frequency INTEGER NOT NULL DEFAULT 0
         )
         """)
-        db.commit()
+        await db.commit()
         print("数据库表初始化完成。")
 
 
 # ==============================================================================
-# 1. 统一且可扩展的 API 提供者 (无变化)
+# 2. 统一且可扩展的 API 提供者 (异步改造)
 # ==============================================================================
 class TranslationProvider:
     def __init__(self, provider_name, config: ConfigParser):
@@ -65,15 +133,10 @@ class TranslationProvider:
             raise ValueError(
                 f"配置错误: 在 config.ini 中未找到名为 '[{provider_name}]' 的配置节"
             )
-
         provider_config = config[provider_name]
         default_config = config["DEFAULT"]
 
-        # 环境变量解析辅助函数
         def get_config_value(section, key, fallback=""):
-            """从配置中获取值，并解析环境变量。"""
-            # ConfigParser 默认支持环境变量插值，但我们需要更灵活的处理
-            # 使用 os.path.expandvars 来解析 ${VAR} 或 $VAR 格式
             raw_value = section.get(key, fallback)
             return os.path.expandvars(raw_value)
 
@@ -82,31 +145,21 @@ class TranslationProvider:
         self.model = get_config_value(provider_config, "model", fallback="default")
         self.api_key = get_config_value(provider_config, "api_key", fallback="")
         self.use_system_role = provider_config.getboolean("use_system_role", True)
-
-        # 优先使用 provider_config 的 system_prompt，否则回退到 default_config
         self.system_prompt = get_config_value(
             provider_config,
             "system_prompt",
             fallback=get_config_value(default_config, "system_prompt"),
         )
-
-        # 优先使用 provider_config 的 proxy，否则回退到 default_config
         self.proxy = get_config_value(
             provider_config,
             "proxy",
             fallback=get_config_value(default_config, "proxy", None),
         )
-
-        # 解析所有以 'header_' 开头的自定义请求头
         self.custom_headers = {}
         for key, value in provider_config.items():
             if key.startswith("header_"):
-                # 将 'header_http-referer' 转换为 'HTTP-Referer'
                 header_name = key[len("header_") :].replace("_", "-").title()
-                # 同样解析环境变量
                 self.custom_headers[header_name] = os.path.expandvars(value)
-
-        # 初始化速率限制器
         self.rate_limit_count = provider_config.getint(
             "rate_limit_count", fallback=default_config.getint("rate_limit_count", 0)
         )
@@ -116,34 +169,28 @@ class TranslationProvider:
         )
 
         if self.rate_limit_count > 0:
-            # 使用 deque 存储最近的请求时间戳
             self.request_timestamps = collections.deque()
-            # 确保在多线程环境下对 deque 的操作是安全的
-            self.rate_limit_lock = threading.Lock()
+            self.rate_limit_lock = asyncio.Lock()
             print(
                 f"[{self.provider_name}] 已启用速率限制: 每 {self.rate_limit_period} 秒最多 {self.rate_limit_count} 次请求。"
             )
         else:
             print(f"[{self.provider_name}] 未启用速率限制。")
 
-    def _wait_for_rate_limit(self):
-        """如果达到速率限制，则阻塞并等待。"""
+    async def _wait_for_rate_limit(self):
+        """如果达到速率限制，则异步等待。"""
         if self.rate_limit_count <= 0:
-            return  # 未启用速率限制
+            return
 
-        with self.rate_limit_lock:
+        async with self.rate_limit_lock:
             current_time = time.time()
-
-            # 1. 移除时间窗口之外的旧时间戳
             while (
                 self.request_timestamps
                 and self.request_timestamps[0] < current_time - self.rate_limit_period
             ):
                 self.request_timestamps.popleft()
 
-            # 2. 检查是否已达到限制
             if len(self.request_timestamps) >= self.rate_limit_count:
-                # 计算需要等待的时间
                 wait_time = (
                     self.request_timestamps[0] + self.rate_limit_period - current_time
                 )
@@ -151,62 +198,50 @@ class TranslationProvider:
                     print(
                         f"[{self.provider_name}] 达到速率限制，等待 {wait_time:.2f} 秒..."
                     )
-                    time.sleep(wait_time)
-
-            # 3. 记录当前请求的时间戳
+                    await asyncio.sleep(wait_time)
             self.request_timestamps.append(time.time())
 
     def _build_headers(self):
-        """构建请求头"""
         headers = {"Content-Type": "application/json"}
         if self.api_key and self.api_key != "no-key-required":
             headers["Authorization"] = f"Bearer {self.api_key}"
-        # 添加所有自定义头
         headers.update(self.custom_headers)
         return headers
 
     def _build_payload(self, prompt):
-        """构建请求体"""
         messages = []
         if self.use_system_role:
             messages.append({"role": "system", "content": self.system_prompt})
             messages.append({"role": "user", "content": prompt})
         else:
-            # 对于不支持 system 角色的模型，将 system prompt 手动加到 user prompt 前面
             full_prompt = f"{self.system_prompt}\n\n---\n\n{prompt}"
             messages.append({"role": "user", "content": full_prompt})
-
         return {"model": self.model, "messages": messages}
 
     def _parse_response(self, response_json):
-        """默认的响应解析器，适用于OpenAI格式的API"""
         return response_json["choices"][0]["message"]["content"]
 
-    def translate(self, sentence, target_word):
-        """执行翻译的完整流程"""
-        self._wait_for_rate_limit()
+    async def translate(self, sentence, target_word):
+        """执行翻译的完整流程 (异步)"""
+        await self._wait_for_rate_limit()
         prompt = f"翻译下面句子中的「{target_word}」：{sentence}"
 
         headers = self._build_headers()
         payload = self._build_payload(prompt)
 
-        # 配置网络代理
-        proxies = None
-        if self.proxy:
-            proxies = {"http": self.proxy, "https": self.proxy}
-
         try:
-            response = requests.post(
-                self.api_url, headers=headers, json=payload, proxies=proxies
-            )
-            response.raise_for_status()
+            async with httpx.AsyncClient(proxy=self.proxy, timeout=30.0) as client:
+                response = await client.post(
+                    self.api_url, headers=headers, json=payload
+                )
+                response.raise_for_status()
 
             translated_content = self._parse_response(response.json())
             if len(translated_content) > 30:
                 raise ValueError("翻译结果过长")
             return translated_content
 
-        except requests.exceptions.RequestException as e:
+        except httpx.RequestError as e:
             print(f"[{self.provider_name}] 调用 API 失败: {e}")
             raise
         except (KeyError, IndexError, ValueError) as e:
@@ -215,170 +250,132 @@ class TranslationProvider:
 
 
 # ==============================================================================
-# 2. 缓存系统 (已修改，不再管理连接)
+# 3. 缓存系统 (异步改造)
 # ==============================================================================
 class TranslationCache:
     """
-    翻译缓存类，不再管理数据库连接，而是从请求上下文中获取连接。
+    翻译缓存类，所有数据库操作都改为异步。
     """
 
     def _generate_key(self, sentence, target_word):
         key_string = f"{sentence}|{target_word}"
         return hashlib.md5(key_string.encode("utf-8")).hexdigest()
 
-    def get(self, sentence, target_word):
+    async def get(self, sentence, target_word, db: aiosqlite.Connection):
         key = self._generate_key(sentence, target_word)
-        cursor = get_db().cursor()
-        cursor.execute(
+        cursor = await db.execute(
             "SELECT translation FROM translation_cache WHERE key = ?", (key,)
         )
-        row = cursor.fetchone()
+        row = await cursor.fetchone()
+        await cursor.close()
         return row[0] if row else None
 
-    def set(self, sentence, target_word, translation):
+    async def set(self, sentence, target_word, translation, db: aiosqlite.Connection):
         key = self._generate_key(sentence, target_word)
         timestamp = int(time.time())
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute(
+        await db.execute(
             "INSERT OR REPLACE INTO translation_cache (key, sentence, target_word, translation, timestamp) VALUES (?, ?, ?, ?, ?)",
             (key, sentence, target_word, translation, timestamp),
         )
-        db.commit()
+        await db.commit()
 
-    def increment_word_frequency(self, word):
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute(
+    async def increment_word_frequency(self, word, db: aiosqlite.Connection):
+        cursor = await db.execute(
             "UPDATE word_frequency SET frequency = frequency + 1 WHERE word = ?",
             (word,),
         )
         if cursor.rowcount == 0:
-            cursor.execute(
+            await db.execute(
                 "INSERT INTO word_frequency (word, frequency) VALUES (?, 1)", (word,)
             )
-        db.commit()
-        new_freq = self.get_word_frequency(word)
+        await db.commit()
+        await cursor.close()
+        new_freq = await self.get_word_frequency(word, db)
         print(f"词语 '{word}' 选择次数更新为: {new_freq}")
 
-    def get_word_frequency(self, word):
-        cursor = get_db().cursor()
-        cursor.execute("SELECT frequency FROM word_frequency WHERE word = ?", (word,))
-        row = cursor.fetchone()
+    async def get_word_frequency(self, word, db: aiosqlite.Connection):
+        cursor = await db.execute(
+            "SELECT frequency FROM word_frequency WHERE word = ?", (word,)
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
         return row[0] if row else 0
 
-    def weighted_choice(self, words):
+    async def weighted_choice(self, words, db: aiosqlite.Connection):
         if not words:
             return None
         if len(words) == 1:
             return words[0]
-        weights = [1.0 / (self.get_word_frequency(word) + 1) for word in words]
+
+        # 并发获取所有词的频率
+        freq_tasks = [self.get_word_frequency(word, db) for word in words]
+        frequencies = await asyncio.gather(*freq_tasks)
+
+        weights = [1.0 / (freq + 1) for freq in frequencies]
         return random.choices(words, weights=weights, k=1)[0]
 
 
 # ==============================================================================
-# 3. Flask 应用 (已修改)
+# 4. FastAPI 端点 (异步改造)
 # ==============================================================================
+@app.post("/translate")
+async def translate_word(request: Request, db: aiosqlite.Connection = Depends(get_db)):
+    try:
+        data = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="无效的JSON")
 
-app = Flask(__name__)
-CORS(app)
-
-
-# 3. 注册一个函数，在每个请求结束后关闭数据库连接
-@app.teardown_appcontext
-def close_connection(exception):
-    db = getattr(g, "_database", None)
-    if db is not None:
-        db.close()
-
-
-# 全局变量
-translation_cache = TranslationCache()  # 现在它只是一个纯粹的逻辑处理器
-translation_provider = None
-
-
-@app.route("/translate", methods=["POST"])
-def translate_word():
-    data = request.json
     if not data or "sentence" not in data:
-        return jsonify({"error": "请输入有效的JSON，并包含 'sentence' 字段"}), 400
+        raise HTTPException(
+            status_code=400, detail="请输入有效的JSON，并包含 'sentence' 字段"
+        )
 
     context_sentence = data["sentence"]
+    # jieba 不是异步的，但在CPU密集型任务中这通常没问题
     words = pseg.lcut(context_sentence)
     result = [
         word for word, flag in words if flag.startswith("n") or flag.startswith("v")
     ]
     if not result:
-        return jsonify({"error": "句子中未找到可翻译的名词或动词"}), 404
+        raise HTTPException(status_code=404, detail="句子中未找到可翻译的名词或动词")
 
-    target_word = translation_cache.weighted_choice(result)
-    translation_cache.increment_word_frequency(target_word)
+    target_word = await translation_cache.weighted_choice(result, db)
+    await translation_cache.increment_word_frequency(target_word, db)
 
-    cached = translation_cache.get(context_sentence, target_word)
+    cached = await translation_cache.get(context_sentence, target_word, db)
     if cached:
         print(f"从缓存命中: {target_word} -> {cached}")
-        return jsonify(
-            {"target_word": target_word, "translation": cached, "from_cache": True}
-        )
+        return {"target_word": target_word, "translation": cached, "from_cache": True}
 
     try:
         print(f"通过 [{translation_provider.provider_name}] API 翻译: {target_word}")
-        translated_content = translation_provider.translate(
+        translated_content = await translation_provider.translate(
             context_sentence, target_word
         )
-        translation_cache.set(context_sentence, target_word, translated_content)
-        print(f"翻译结果已缓存: {target_word} -> {translated_content}")
-        return jsonify(
-            {
-                "target_word": target_word,
-                "translation": translated_content,
-                "from_cache": False,
-            }
+        await translation_cache.set(
+            context_sentence, target_word, translated_content, db
         )
+        print(f"翻译结果已缓存: {target_word} -> {translated_content}")
+        return {
+            "target_word": target_word,
+            "translation": translated_content,
+            "from_cache": False,
+        }
     except Exception as e:
-        return jsonify({"error": f"处理翻译请求时发生错误: {e}"}), 502
+        # 客户端取消请求时，httpx会抛出异常，FastAPI会捕获并正确处理连接关闭
+        # 这里我们记录一个通用错误
+        print(f"处理翻译请求时发生错误: {e}")
+        raise HTTPException(status_code=502, detail=f"处理翻译请求时发生错误: {str(e)}")
 
 
 # ==============================================================================
-# 4. 主程序入口
+# 5. 主程序入口 (用于 Uvicorn)
 # ==============================================================================
-
 if __name__ == "__main__":
-    load_dotenv()
-    print("已加载 .env 文件中的环境变量。")
+    # 这个部分现在只是为了方便直接运行（虽然不推荐用于生产）
+    # 推荐的启动方式是: uvicorn gguf_model:app --reload
+    import uvicorn
 
-    parser = argparse.ArgumentParser(description="启动 TransLens 后端翻译服务。")
-    parser.add_argument(
-        "--provider",
-        type=str,
-        help="指定要使用的 API 提供者 (必须在 config.ini 中定义)。",
-    )
-    args = parser.parse_args()
-
-    config = ConfigParser()
-    config.read("config.ini", encoding="utf-8")
-
-    default_provider_from_config = os.path.expandvars(
-        config.get("DEFAULT", "provider", fallback="local_llama")
-    )
-    provider_name = args.provider or default_provider_from_config
-
-    print("-" * 50)
-    print(f"准备启动服务，使用 API 提供者: '{provider_name}'")
-
-    try:
-        # 4. 初始化数据库 (如果文件不存在)
-        if not os.path.exists(DATABASE_FILE):
-            print(f"数据库文件 '{DATABASE_FILE}' 不存在，正在创建...")
-            init_db()
-        else:
-            print(f"已连接到现有数据库: '{DATABASE_FILE}'")
-
-        translation_provider = TranslationProvider(provider_name, config)
-    except (ValueError, NoSectionError, NoOptionError) as e:
-        print(f"\n[错误] 初始化提供者失败: {e}")
-        print("请检查您的命令行参数和 config.ini 文件是否正确。\n")
-        exit(1)
-
-    print("-" * 50)
-    app.run(debug=True, port=5000)
+    print("正在以开发模式启动 Uvicorn 服务器...")
+    print("推荐的生产启动方式是: uvicorn gguf_model:app --workers 4")
+    uvicorn.run(app, host="127.0.0.1", port=5000)
