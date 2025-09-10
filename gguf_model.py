@@ -7,22 +7,59 @@ import hashlib
 import time
 import argparse
 import sqlite3
+import collections
+import threading
 from configparser import ConfigParser, NoSectionError, NoOptionError
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g  # <-- 1. 导入 g
 from flask_cors import CORS
 from dotenv import load_dotenv
 
 # ==============================================================================
-# 1. 统一且可扩展的 API 提供者
+# 0. 数据库管理 (新)
 # ==============================================================================
+DATABASE_FILE = "translens_data.db"
 
 
+def get_db():
+    """
+    为当前请求获取数据库连接。如果连接不存在，则创建一个新的。
+    """
+    db = getattr(g, "_database", None)
+    if db is None:
+        db = g._database = sqlite3.connect(DATABASE_FILE)
+    return db
+
+
+def init_db():
+    """初始化数据库，创建表结构。"""
+    with app.app_context():
+        db = get_db()
+        cursor = db.cursor()
+        # 创建翻译缓存表
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS translation_cache (
+            key TEXT PRIMARY KEY,
+            sentence TEXT NOT NULL,
+            target_word TEXT NOT NULL,
+            translation TEXT NOT NULL,
+            timestamp INTEGER NOT NULL
+        )
+        """)
+        # 创建词频表
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS word_frequency (
+            word TEXT PRIMARY KEY,
+            frequency INTEGER NOT NULL DEFAULT 0
+        )
+        """)
+        db.commit()
+        print("数据库表初始化完成。")
+
+
+# ==============================================================================
+# 1. 统一且可扩展的 API 提供者 (无变化)
+# ==============================================================================
 class TranslationProvider:
-    """
-    一个完全由配置驱动的通用翻译 API 提供者。
-    支持自定义请求头、网络代理和环境变量占位符。
-    """
-
     def __init__(self, provider_name, config: ConfigParser):
         if not config.has_section(provider_name):
             raise ValueError(
@@ -69,9 +106,55 @@ class TranslationProvider:
                 # 同样解析环境变量
                 self.custom_headers[header_name] = os.path.expandvars(value)
 
-        print(
-            f"[{self.provider_name}] 提供者已初始化。模型: {self.model}, 使用代理: {self.proxy or '无'}"
+        # 初始化速率限制器
+        self.rate_limit_count = provider_config.getint(
+            "rate_limit_count", fallback=default_config.getint("rate_limit_count", 0)
         )
+        self.rate_limit_period = provider_config.getint(
+            "rate_limit_period_seconds",
+            fallback=default_config.getint("rate_limit_period_seconds", 60),
+        )
+
+        if self.rate_limit_count > 0:
+            # 使用 deque 存储最近的请求时间戳
+            self.request_timestamps = collections.deque()
+            # 确保在多线程环境下对 deque 的操作是安全的
+            self.rate_limit_lock = threading.Lock()
+            print(
+                f"[{self.provider_name}] 已启用速率限制: 每 {self.rate_limit_period} 秒最多 {self.rate_limit_count} 次请求。"
+            )
+        else:
+            print(f"[{self.provider_name}] 未启用速率限制。")
+
+    def _wait_for_rate_limit(self):
+        """如果达到速率限制，则阻塞并等待。"""
+        if self.rate_limit_count <= 0:
+            return  # 未启用速率限制
+
+        with self.rate_limit_lock:
+            current_time = time.time()
+
+            # 1. 移除时间窗口之外的旧时间戳
+            while (
+                self.request_timestamps
+                and self.request_timestamps[0] < current_time - self.rate_limit_period
+            ):
+                self.request_timestamps.popleft()
+
+            # 2. 检查是否已达到限制
+            if len(self.request_timestamps) >= self.rate_limit_count:
+                # 计算需要等待的时间
+                wait_time = (
+                    self.request_timestamps[0] + self.rate_limit_period - current_time
+                )
+                if wait_time > 0:
+                    print(
+                        f"[{self.provider_name}] 达到速率限制，等待 {wait_time:.2f} 秒..."
+                    )
+                    time.sleep(wait_time)
+
+            # 3. 记录当前请求的时间戳
+            self.request_timestamps.append(time.time())
 
     def _build_headers(self):
         """构建请求头"""
@@ -101,6 +184,7 @@ class TranslationProvider:
 
     def translate(self, sentence, target_word):
         """执行翻译的完整流程"""
+        self._wait_for_rate_limit()
         prompt = f"翻译下面句子中的「{target_word}」：{sentence}"
 
         headers = self._build_headers()
@@ -131,94 +215,40 @@ class TranslationProvider:
 
 
 # ==============================================================================
-# 2. 缓存系统 (未改变)
+# 2. 缓存系统 (已修改，不再管理连接)
 # ==============================================================================
 class TranslationCache:
     """
-    翻译缓存类，使用 SQLite 数据库进行持久化存储，
-    并跟踪词语选择频率。
+    翻译缓存类，不再管理数据库连接，而是从请求上下文中获取连接。
     """
 
-    def __init__(self, db_file="translens_data.db"):
-        self.db_file = db_file
-        self.conn = None
-        try:
-            self.conn = sqlite3.connect(self.db_file, check_same_thread=False)
-            print(f"数据库连接成功: {self.db_file}")
-            self._init_db()
-        except sqlite3.Error as e:
-            print(f"数据库错误: {e}")
-            exit(1)  # 如果数据库无法连接，则终止程序
-
-    def _init_db(self):
-        """初始化数据库，创建所需的表"""
-        cursor = self.conn.cursor()
-        # 创建翻译缓存表
-        # key 是 sentence 和 target_word 的 MD5 哈希值，确保唯一性
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS translation_cache (
-            key TEXT PRIMARY KEY,
-            sentence TEXT NOT NULL,
-            target_word TEXT NOT NULL,
-            translation TEXT NOT NULL,
-            timestamp INTEGER NOT NULL
-        )
-        """)
-        # 创建词频表
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS word_frequency (
-            word TEXT PRIMARY KEY,
-            frequency INTEGER NOT NULL DEFAULT 0
-        )
-        """)
-        self.conn.commit()
-        print("数据库表初始化完成。")
-
     def _generate_key(self, sentence, target_word):
-        """根据句子和目标词生成缓存键"""
         key_string = f"{sentence}|{target_word}"
         return hashlib.md5(key_string.encode("utf-8")).hexdigest()
 
-    # 不再需要 load_cache 和 save_cache，数据库会自动处理
-    # 不再需要 load_frequency 和 save_frequency
-
     def get(self, sentence, target_word):
-        """从数据库获取缓存的翻译结果"""
         key = self._generate_key(sentence, target_word)
-        cursor = self.conn.cursor()
+        cursor = get_db().cursor()
         cursor.execute(
-            "SELECT translation, sentence, target_word, timestamp FROM translation_cache WHERE key = ?",
-            (key,),
+            "SELECT translation FROM translation_cache WHERE key = ?", (key,)
         )
         row = cursor.fetchone()
-        if row:
-            return {
-                "translation": row[0],
-                "sentence": row[1],
-                "target_word": row[2],
-                "timestamp": row[3],
-            }
-        return None
+        return row[0] if row else None
 
     def set(self, sentence, target_word, translation):
-        """向数据库设置缓存的翻译结果"""
         key = self._generate_key(sentence, target_word)
         timestamp = int(time.time())
-        cursor = self.conn.cursor()
-        # 使用 INSERT OR REPLACE 实现存在即更新，不存在即插入
+        db = get_db()
+        cursor = db.cursor()
         cursor.execute(
-            """
-        INSERT OR REPLACE INTO translation_cache (key, sentence, target_word, translation, timestamp)
-        VALUES (?, ?, ?, ?, ?)
-        """,
+            "INSERT OR REPLACE INTO translation_cache (key, sentence, target_word, translation, timestamp) VALUES (?, ?, ?, ?, ?)",
             (key, sentence, target_word, translation, timestamp),
         )
-        self.conn.commit()
+        db.commit()
 
     def increment_word_frequency(self, word):
-        """增加词语被选择的次数"""
-        cursor = self.conn.cursor()
-        # 首先尝试更新，如果词语不存在，则插入
+        db = get_db()
+        cursor = db.cursor()
         cursor.execute(
             "UPDATE word_frequency SET frequency = frequency + 1 WHERE word = ?",
             (word,),
@@ -227,54 +257,44 @@ class TranslationCache:
             cursor.execute(
                 "INSERT INTO word_frequency (word, frequency) VALUES (?, 1)", (word,)
             )
-        self.conn.commit()
-
-        # 打印更新后的频率以供调试
+        db.commit()
         new_freq = self.get_word_frequency(word)
         print(f"词语 '{word}' 选择次数更新为: {new_freq}")
 
     def get_word_frequency(self, word):
-        """从数据库获取词语被选择的次数"""
-        cursor = self.conn.cursor()
+        cursor = get_db().cursor()
         cursor.execute("SELECT frequency FROM word_frequency WHERE word = ?", (word,))
         row = cursor.fetchone()
         return row[0] if row else 0
 
     def weighted_choice(self, words):
-        """基于反向权重选择词语，被选择次数越多的词语权重越低"""
         if not words:
             return None
-
         if len(words) == 1:
             return words[0]
+        weights = [1.0 / (self.get_word_frequency(word) + 1) for word in words]
+        return random.choices(words, weights=weights, k=1)[0]
 
-        weights = []
-        for word in words:
-            frequency = self.get_word_frequency(word)
-            # 使用反向权重公式：1/(frequency + 1)
-            weight = 1.0 / (frequency + 1)
-            weights.append(weight)
-
-        # 使用 random.choices 进行带权重的随机选择，更简洁
-        chosen_word = random.choices(words, weights=weights, k=1)[0]
-        return chosen_word
-
-    def __del__(self):
-        """在对象销毁时关闭数据库连接"""
-        if self.conn:
-            self.conn.close()
-            print("数据库连接已关闭。")
 
 # ==============================================================================
-# 3. Flask 应用
+# 3. Flask 应用 (已修改)
 # ==============================================================================
 
 app = Flask(__name__)
 CORS(app)
 
+
+# 3. 注册一个函数，在每个请求结束后关闭数据库连接
+@app.teardown_appcontext
+def close_connection(exception):
+    db = getattr(g, "_database", None)
+    if db is not None:
+        db.close()
+
+
 # 全局变量
-translation_cache = TranslationCache()
-translation_provider = None  # 将在 main 函数中初始化
+translation_cache = TranslationCache()  # 现在它只是一个纯粹的逻辑处理器
+translation_provider = None
 
 
 @app.route("/translate", methods=["POST"])
@@ -288,7 +308,6 @@ def translate_word():
     result = [
         word for word, flag in words if flag.startswith("n") or flag.startswith("v")
     ]
-
     if not result:
         return jsonify({"error": "句子中未找到可翻译的名词或动词"}), 404
 
@@ -297,13 +316,9 @@ def translate_word():
 
     cached = translation_cache.get(context_sentence, target_word)
     if cached:
-        print(f"从缓存命中: {target_word} -> {cached['translation']}")
+        print(f"从缓存命中: {target_word} -> {cached}")
         return jsonify(
-            {
-                "target_word": target_word,
-                "translation": cached["translation"],
-                "from_cache": True,
-            }
+            {"target_word": target_word, "translation": cached, "from_cache": True}
         )
 
     try:
@@ -311,10 +326,8 @@ def translate_word():
         translated_content = translation_provider.translate(
             context_sentence, target_word
         )
-
         translation_cache.set(context_sentence, target_word, translated_content)
         print(f"翻译结果已缓存: {target_word} -> {translated_content}")
-
         return jsonify(
             {
                 "target_word": target_word,
@@ -322,17 +335,15 @@ def translate_word():
                 "from_cache": False,
             }
         )
-
     except Exception as e:
         return jsonify({"error": f"处理翻译请求时发生错误: {e}"}), 502
+
 
 # ==============================================================================
 # 4. 主程序入口
 # ==============================================================================
 
 if __name__ == "__main__":
-    # 2. 在程序开始时加载 .env 文件
-    # 这会把 .env 文件中的键值对加载到环境变量中
     load_dotenv()
     print("已加载 .env 文件中的环境变量。")
 
@@ -344,13 +355,9 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # 3. 修改 ConfigParser，使其能够处理环境变量
-    # 我们将在 TranslationProvider 内部使用 os.path.expandvars，
-    # 所以这里的 ConfigParser 不需要特殊设置。
     config = ConfigParser()
     config.read("config.ini", encoding="utf-8")
 
-    # 命令行参数 > config.ini [DEFAULT] provider > fallback
     default_provider_from_config = os.path.expandvars(
         config.get("DEFAULT", "provider", fallback="local_llama")
     )
@@ -360,11 +367,18 @@ if __name__ == "__main__":
     print(f"准备启动服务，使用 API 提供者: '{provider_name}'")
 
     try:
+        # 4. 初始化数据库 (如果文件不存在)
+        if not os.path.exists(DATABASE_FILE):
+            print(f"数据库文件 '{DATABASE_FILE}' 不存在，正在创建...")
+            init_db()
+        else:
+            print(f"已连接到现有数据库: '{DATABASE_FILE}'")
+
         translation_provider = TranslationProvider(provider_name, config)
     except (ValueError, NoSectionError, NoOptionError) as e:
         print(f"\n[错误] 初始化提供者失败: {e}")
         print("请检查您的命令行参数和 config.ini 文件是否正确。\n")
         exit(1)
-    print("-" * 50)
 
+    print("-" * 50)
     app.run(debug=True, port=5000)
