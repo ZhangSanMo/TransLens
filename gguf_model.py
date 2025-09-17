@@ -14,6 +14,7 @@ import jieba.posseg as pseg
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from typing import List, Dict
 
 # ==============================================================================
 # 0. 全局变量、自定义异常和应用生命周期
@@ -46,9 +47,8 @@ async def lifespan(app: FastAPI):
     try:
         if not os.path.exists(DATABASE_FILE):
             print(f"数据库文件 '{DATABASE_FILE}' 不存在，正在创建...")
-            await init_db()
-        else:
-            print(f"已连接到现有数据库: '{DATABASE_FILE}'")
+        await init_db()
+        print(f"已连接并初始化数据库: '{DATABASE_FILE}'")
         translation_provider = TranslationProvider(provider_name, config)
         translation_cache = TranslationCache()
     except (ValueError, NoSectionError, NoOptionError) as e:
@@ -69,10 +69,11 @@ app.add_middleware(
 )
 
 # ==============================================================================
-# 1. 数据库管理 (无需修改)
+# 1. 数据库管理 (添加新表)
 # ==============================================================================
 async def get_db():
     db = await aiosqlite.connect(DATABASE_FILE)
+    db.row_factory = aiosqlite.Row # 方便按列名访问
     try:
         yield db
     finally:
@@ -80,14 +81,23 @@ async def get_db():
 
 async def init_db():
     async with aiosqlite.connect(DATABASE_FILE) as db:
+        # 缓存表
         await db.execute("""
         CREATE TABLE IF NOT EXISTS translation_cache (
             key TEXT PRIMARY KEY, sentence TEXT NOT NULL, target_word TEXT NOT NULL,
             translation TEXT NOT NULL, timestamp INTEGER NOT NULL
         )""")
+        # 词频表
         await db.execute("""
         CREATE TABLE IF NOT EXISTS word_frequency (
             word TEXT PRIMARY KEY, frequency INTEGER NOT NULL DEFAULT 0
+        )""")
+        # <<< 新增功能：记忆曲线/“太简单”单词表
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS word_memory (
+            word TEXT PRIMARY KEY,
+            level INTEGER NOT NULL DEFAULT 1,
+            suppress_until INTEGER NOT NULL
         )""")
         await db.commit()
         print("数据库表初始化完成。")
@@ -96,7 +106,6 @@ async def init_db():
 # 2. API 提供者 (核心改造)
 # ==============================================================================
 class TranslationProvider:
-    # ... (__init__, _build_headers, _build_payload, _parse_response 方法无需修改) ...
     def __init__(self, provider_name, config: ConfigParser):
         if not config.has_section(provider_name):
             raise ValueError(f"配置错误: 在 config.ini 中未找到名为 '[{provider_name}]' 的配置节")
@@ -184,7 +193,7 @@ class TranslationProvider:
                 response.raise_for_status()
             translated_content = self._parse_response(response.json())
             if len(translated_content) > 30:
-                raise ValueError("翻译结果过长")
+                raise ValueError(f"翻译结果过长:{translated_content}")
             return translated_content
         except httpx.RequestError as e:
             print(f"[{self.provider_name}] 调用 API 失败: {e}")
@@ -194,10 +203,9 @@ class TranslationProvider:
             raise
 
 # ==============================================================================
-# 3. 缓存系统 (无需修改)
+# 3. 缓存系统 (新增了与新表交互的方法)
 # ==============================================================================
 class TranslationCache:
-    # ... (这个类的所有方法都与之前相同，无需修改) ...
     def _generate_key(self, sentence, target_word):
         return hashlib.md5(f"{sentence}|{target_word}".encode("utf-8")).hexdigest()
     async def get(self, sentence, target_word, db: aiosqlite.Connection):
@@ -227,7 +235,26 @@ class TranslationCache:
         frequencies = await asyncio.gather(*freq_tasks)
         weights = [1.0 / (freq + 1) for freq in frequencies]
         return random.choices(words, weights=weights, k=1)[0]
+    
+    # <<< 新增功能：获取未被抑制的单词
+    async def get_eligible_words(self, words: List[str], db: aiosqlite.Connection) -> List[str]:
+        if not words:
+            return []
+        
+        # 使用参数化查询防止SQL注入
+        placeholders = ','.join('?' for _ in words)
+        query = f"SELECT word FROM word_memory WHERE word IN ({placeholders}) AND suppress_until > ?"
+        
+        current_time = int(time.time())
+        
+        async with db.execute(query, words + [current_time]) as cursor:
+            suppressed_words = {row['word'] for row in await cursor.fetchall()}
 
+        if suppressed_words:
+            print(f"过滤掉以下简单词: {', '.join(suppressed_words)}")
+            
+        eligible = [word for word in words if word not in suppressed_words]
+        return eligible
 
 # ==============================================================================
 # 4. FastAPI 端点 (核心改造)
@@ -241,11 +268,20 @@ async def translate_word(request: Request, db: aiosqlite.Connection = Depends(ge
             raise HTTPException(status_code=400, detail="JSON中必须包含 'sentence' 字段")
 
         words = pseg.lcut(context_sentence)
-        result = [word for word, flag in words if flag.startswith("n") or flag.startswith("v")]
-        if not result:
+        candidate_words = list(set([word for word, flag in words if flag.startswith("n") or flag.startswith("v")]))
+        if not candidate_words:
             raise HTTPException(status_code=404, detail="句子中未找到可翻译的名词或动词")
 
-        target_word = await translation_cache.weighted_choice(result, db)
+        # <<< 新增功能：从候选词中过滤掉“太简单”的词
+        eligible_words = await translation_cache.get_eligible_words(candidate_words, db)
+        if not eligible_words:
+            print("所有候选词都因“太简单”被过滤，本次不翻译。")
+            raise HTTPException(status_code=404, detail="所有候选词均被标记为简单词")
+
+        target_word = await translation_cache.weighted_choice(eligible_words, db)
+        if not target_word:
+             raise HTTPException(status_code=404, detail="无法从合格词中选择目标词")
+
         await translation_cache.increment_word_frequency(target_word, db)
 
         cached = await translation_cache.get(context_sentence, target_word, db)
@@ -255,7 +291,6 @@ async def translate_word(request: Request, db: aiosqlite.Connection = Depends(ge
 
         print(f"通过 [{translation_provider.provider_name}] API 翻译: {target_word}")
         
-        # <<< 5. 将 request 对象传递下去
         translated_content = await translation_provider.translate(
             context_sentence, target_word, request=request
         )
@@ -264,16 +299,49 @@ async def translate_word(request: Request, db: aiosqlite.Connection = Depends(ge
         print(f"翻译结果已缓存: {target_word} -> {translated_content}")
         return {"target_word": target_word, "translation": translated_content, "from_cache": False}
 
-    # <<< 6. 捕获我们自定义的异常，并优雅地处理它
     except ClientDisconnectedError:
-        # 这是一个正常的业务场景，不是服务器错误，所以我们不返回错误码
-        # 只是在服务器端记录一下，然后让连接正常关闭
         print("请求处理被中断，因为客户端已断开连接。")
-        # 返回一个空响应或特定响应码也可以，但通常直接让连接关闭即可
         return 
     except Exception as e:
         print(f"处理翻译请求时发生未知错误: {e}")
         raise HTTPException(status_code=502, detail=f"处理翻译请求时发生错误: {str(e)}")
+
+
+# <<< 新增功能：标记单词为“太简单”的端点
+@app.post("/mark_easy")
+async def mark_word_as_easy(request: Request, db: aiosqlite.Connection = Depends(get_db)):
+    try:
+        data = await request.json()
+        word = data.get("word")
+        if not word:
+            raise HTTPException(status_code=400, detail="JSON中必须包含 'word' 字段")
+
+        # 查找现有等级
+        async with db.execute("SELECT level FROM word_memory WHERE word = ?", (word,)) as cursor:
+            row = await cursor.fetchone()
+        
+        current_level = row['level'] if row else 0
+        new_level = current_level + 1
+
+        # 计算抑制时间（遗忘曲线）: level^2 天
+        # Level 1: 1 day, Level 2: 4 days, Level 3: 9 days, etc.
+        days_to_suppress = new_level ** 2
+        suppress_duration_seconds = days_to_suppress * 24 * 60 * 60
+        suppress_until_timestamp = int(time.time()) + suppress_duration_seconds
+
+        await db.execute(
+            "INSERT OR REPLACE INTO word_memory (word, level, suppress_until) VALUES (?, ?, ?)",
+            (word, new_level, suppress_until_timestamp)
+        )
+        await db.commit()
+        
+        print(f"单词 '{word}' 已被标记为简单 (等级: {new_level}). 在 {days_to_suppress} 天内将不再翻译.")
+        return {"status": "success", "word": word, "new_level": new_level, "suppress_days": days_to_suppress}
+
+    except Exception as e:
+        print(f"处理 '/mark_easy' 请求时发生错误: {e}")
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {str(e)}")
+
 
 # ==============================================================================
 # 5. 主程序入口 (无需修改)
